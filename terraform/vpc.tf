@@ -178,6 +178,10 @@ resource "aws_security_group" "fargate" {
   }
 
   tags = { Name = "${var.project_name}-fargate-sg" }
+
+  lifecycle {
+    ignore_changes = [description]
+  }
 }
 
 # VPC endpoints security group
@@ -202,4 +206,8 @@ resource "aws_security_group" "vpc_endpoints" {
   }
 
   tags = { Name = "${var.project_name}-vpc-endpoints-sg" }
+
+  lifecycle {
+    ignore_changes = [description]
+  }
 }
