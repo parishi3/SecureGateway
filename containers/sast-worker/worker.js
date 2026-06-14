@@ -45,7 +45,7 @@ async function cloneRepo(repo, commitSha, scanId) {
   console.log(`Cloning repo: https://github.com/${repo}.git at commit ${commitSha}`);
   execSync(
     `git clone --depth 1 https://github.com/${repo}.git ${sourceDir}`,
-    { stdio: "inherit", timeout: 120000 }
+    { stdio: "inherit", timeout: 300000 }
   );
 
   // Checkout the specific commit if needed
