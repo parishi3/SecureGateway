@@ -53,8 +53,20 @@ jobs:
           terraform import aws_subnet.private subnet-0f2128a29fe403601 || true
           terraform import aws_subnet.public subnet-07ab5db450403ff7c || true
           terraform import aws_internet_gateway.main igw-09e46a14ad5b2bd47 || true
+          terraform import aws_route_table.private rtb-0043467a24b7ff564 || true
+          terraform import aws_route_table.public rtb-075f9d7e997c3ef81 || true
+          terraform import aws_route_table_association.private rtbassoc-0b77d938d8aef3883 || true
+          terraform import aws_route_table_association.public rtbassoc-05c7315dfdee024c7 || true
+          terraform import aws_security_group.fargate sg-0dd5612bd93dbb9f5 || true
+          terraform import aws_security_group.vpc_endpoints sg-0992a1f930544496b || true
+          terraform import aws_vpc_endpoint.ecr_dkr vpce-0d9c67379d4052082 || true
+          terraform import aws_vpc_endpoint.ecr_api vpce-0077f3438d8c94c5e || true
+          terraform import aws_vpc_endpoint.logs vpce-0cdc8757cad06f55f || true
+          terraform import aws_vpc_endpoint.sqs vpce-00882d88592f6d38c || true
+          terraform import aws_vpc_endpoint.s3 vpce-00e8aa20cd8f6f436 || true
+          terraform import aws_vpc_endpoint.dynamodb vpce-05f3b5579d5705fb3 || true
           terraform destroy -auto-approve || true
-
+          
       - name: Terraform Apply
         run: cd terraform && terraform apply -auto-approve
 
