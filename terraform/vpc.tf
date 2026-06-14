@@ -5,6 +5,10 @@ resource "aws_vpc" "main" {
   enable_dns_support   = true
 
   tags = { Name = "${var.project_name}-vpc" }
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 # ── INTERNET GATEWAY (public subnet only) ────────────────────────
@@ -23,6 +27,10 @@ resource "aws_subnet" "public" {
   map_public_ip_on_launch = true
 
   tags = { Name = "${var.project_name}-public" }
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 # Private subnet — all Fargate tasks run here, no internet egress
@@ -32,6 +40,10 @@ resource "aws_subnet" "private" {
   availability_zone = "${var.aws_region}a"
 
   tags = { Name = "${var.project_name}-private" }
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 # ── ROUTE TABLES ─────────────────────────────────────────────────
