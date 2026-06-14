@@ -1,16 +1,16 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
+import { ECSClient, RunTaskCommand } from "@aws-sdk/client-ecs";
 
 const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const sqs = new SQSClient({});
+const ecs = new ECSClient({});
 
 export const handler = async (event) => {
   console.log('SecureGate Lambda 1 — trigger fired');
-
   let body;
   try {
-    // Fix 10: Improved JSON parsing logic
     if (typeof event.body === 'string') {
       body = JSON.parse(event.body);
     } else if (typeof event.body === 'object' && event.body !== null) {
@@ -22,7 +22,7 @@ export const handler = async (event) => {
     return { statusCode: 400, body: JSON.stringify({ error: 'Invalid JSON' }) };
   }
 
-  const { imageUri, prNumber, commitSha, repo, repoFullName } = body; 
+  const { imageUri, prNumber, commitSha, repo, repoFullName } = body;
   const repoValue = repo || repoFullName;
 
   if (!commitSha || !repoValue) {
@@ -36,7 +36,6 @@ export const handler = async (event) => {
     Key: { scanId: commitSha }
   }));
 
-  // Fix 8: Validate threshold on cache hit
   if (existing.Item && (existing.Item.overall_status === 'complete' || existing.Item.status === 'complete')) {
     console.log('Cache hit — checking if threshold has changed');
     const config = await dynamo.send(new GetCommand({
@@ -44,7 +43,7 @@ export const handler = async (event) => {
       Key: { configKey: 'pentest_skip_threshold' }
     }));
     const currentThreshold = config.Item ? parseInt(config.Item.value) : 3;
-    
+
     if (existing.Item.threshold === currentThreshold) {
       console.log('Cache hit — returning existing result');
       return {
@@ -80,11 +79,11 @@ export const handler = async (event) => {
       status: 'pending',
       threshold,
       timestamp: new Date().toISOString(),
-      expiresAt: Math.floor(Date.now() / 1000) + (30 * 24 * 60 * 60) // 30 days TTL
+      expiresAt: Math.floor(Date.now() / 1000) + (30 * 24 * 60 * 60)
     }
   }));
 
-  // Queue SAST job
+  // Queue SAST job on SQS
   console.log('Queuing SAST job on SQS');
   await sqs.send(new SendMessageCommand({
     QueueUrl: process.env.SAST_QUEUE_URL,
@@ -96,8 +95,28 @@ export const handler = async (event) => {
     })
   }));
 
-  console.log(`Scan queued successfully for commit ${commitSha}`);
+  // Launch SAST Fargate task to process the job
+  console.log('Launching SAST Fargate task');
+  try {
+    await ecs.send(new RunTaskCommand({
+      cluster:        process.env.ECS_CLUSTER,
+      launchType:     'FARGATE',
+      taskDefinition: process.env.SAST_TASK_DEF,
+      networkConfiguration: {
+        awsvpcConfiguration: {
+          subnets:        [process.env.PRIVATE_SUBNET],
+          securityGroups: [process.env.FARGATE_SG],
+          assignPublicIp: 'DISABLED'
+        }
+      }
+    }));
+    console.log('SAST Fargate task launched successfully');
+  } catch (err) {
+    // Non-fatal — SQS message stays in queue, worker will retry
+    console.error('Failed to launch Fargate task:', err.message);
+  }
 
+  console.log(`Scan queued successfully for commit ${commitSha}`);
   return {
     statusCode: 200,
     body: JSON.stringify({
