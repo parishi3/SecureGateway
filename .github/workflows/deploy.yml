@@ -49,10 +49,27 @@ jobs:
           terraform import aws_cloudwatch_log_group.lambda_trigger /aws/lambda/securegateway-trigger || true
           terraform import aws_cloudwatch_log_group.lambda_severity /aws/lambda/securegateway-severity-check || true
           terraform import aws_cloudwatch_log_group.lambda_results /aws/lambda/securegateway-results || true
+          terraform import aws_vpc.main vpc-08f8be46e7775b6af || true
+          terraform import aws_subnet.private subnet-0f2128a29fe403601 || true
+          terraform import aws_subnet.public subnet-07ab5db450403ff7c || true
+          terraform import aws_internet_gateway.main igw-09e46a14ad5b2bd47 || true
           terraform destroy -auto-approve || true
 
       - name: Terraform Apply
         run: cd terraform && terraform apply -auto-approve
+
+      - name: Fix Lambda API Gateway permission
+        run: |
+          API_ID=$(cd terraform && terraform output -raw api_gateway_url | sed 's|https://||' | cut -d'.' -f1)
+          aws lambda remove-permission \
+            --function-name securegateway-trigger \
+            --statement-id AllowAPIGatewayInvoke || true
+          aws lambda add-permission \
+            --function-name securegateway-trigger \
+            --statement-id AllowAPIGatewayInvoke \
+            --action lambda:InvokeFunction \
+            --principal apigateway.amazonaws.com \
+            --source-arn "arn:aws:execute-api:us-east-1:${{ secrets.AWS_ACCOUNT_ID }}:${API_ID}/*/*"
 
       - name: Get Terraform outputs
         id: tf-outputs
