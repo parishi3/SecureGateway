@@ -36,7 +36,6 @@ jobs:
           cd terraform
           terraform import aws_dynamodb_table.scans securegateway-scans || true
           terraform import aws_dynamodb_table.config securegateway-config || true
-          terraform import aws_dynamodb_table_item.pentest_threshold "securegateway-config|configKey|pentest_skip_threshold" || true
           terraform import aws_ecr_repository.sast_scanner securegateway/sast-scanner || true
           terraform import aws_ecr_repository.pentest_worker securegateway/pentest-worker || true
           terraform import aws_ecr_repository.client_scans securegateway/client-scans || true
