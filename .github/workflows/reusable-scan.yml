@@ -84,7 +84,7 @@ jobs:
             -H "x-api-key: ${{ secrets.api-key }}" \
             -H "Content-Type: application/json" \
             -d "{
-              \"imageURI\": \"${{ inputs.ecr-repo }}/client-scans:${{ github.sha }}\",
+              \"imageUri\": \"${{ inputs.ecr-repo }}/client-scans:${{ github.sha }}\",
               \"commitSha\": \"${{ github.sha }}\",
               \"prNumber\": \"${{ github.event.pull_request.number }}\",
               \"repoFullName\": \"${{ github.repository }}\",
