@@ -147,7 +147,7 @@ resource "aws_vpc_endpoint" "logs" {
 # Fargate tasks — private subnet, internal traffic only
 resource "aws_security_group" "fargate" {
   name        = "${var.project_name}-fargate-sg"
-  description = "Fargate tasks - internal VPC traffic only, no internet egress"
+  description = "Fargate tasks - outbound HTTPS for ECR and git clone"
   vpc_id      = aws_vpc.main.id
 
   # allow inbound from within VPC (pentest → target container)
@@ -159,13 +159,22 @@ resource "aws_security_group" "fargate" {
     description = "Internal VPC traffic"
   }
 
-  # allow outbound to VPC only — no internet
+  # allow outbound HTTPS for ECR pulls and git clone
+  egress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "HTTPS for ECR and git clone"
+  }
+
+  # allow outbound to VPC for internal service communication
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["10.0.0.0/16"]
-    description = "Internal VPC traffic only"
+    description = "Internal VPC traffic"
   }
 
   tags = { Name = "${var.project_name}-fargate-sg" }
