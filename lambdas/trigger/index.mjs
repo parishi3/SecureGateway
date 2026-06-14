@@ -2,13 +2,16 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 import { ECSClient, RunTaskCommand } from "@aws-sdk/client-ecs";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 
 const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({}));
-const sqs = new SQSClient({});
-const ecs = new ECSClient({});
+const sqs    = new SQSClient({});
+const ecs    = new ECSClient({});
+const s3     = new S3Client({});
 
 export const handler = async (event) => {
   console.log('SecureGate Lambda 1 — trigger fired');
+
   let body;
   try {
     if (typeof event.body === 'string') {
@@ -22,14 +25,14 @@ export const handler = async (event) => {
     return { statusCode: 400, body: JSON.stringify({ error: 'Invalid JSON' }) };
   }
 
-  const { imageUri, prNumber, commitSha, repo, repoFullName } = body;
+  const { imageUri, prNumber, commitSha, repo, repoFullName, githubToken } = body;
   const repoValue = repo || repoFullName;
 
   if (!commitSha || !repoValue) {
     return { statusCode: 400, body: JSON.stringify({ error: 'Missing commitSha or repo' }) };
   }
 
-  // SHA cache check — skip duplicate scans
+  // SHA cache check
   console.log(`Checking SHA cache for commit: ${commitSha}`);
   const existing = await dynamo.send(new GetCommand({
     TableName: process.env.DYNAMODB_TABLE,
@@ -43,22 +46,17 @@ export const handler = async (event) => {
       Key: { configKey: 'pentest_skip_threshold' }
     }));
     const currentThreshold = config.Item ? parseInt(config.Item.value) : 3;
-
     if (existing.Item.threshold === currentThreshold) {
       console.log('Cache hit — returning existing result');
       return {
         statusCode: 200,
-        body: JSON.stringify({
-          scanId: commitSha,
-          status: 'cached',
-          message: 'Scan already completed for this commit'
-        })
+        body: JSON.stringify({ scanId: commitSha, status: 'cached', message: 'Scan already completed for this commit' })
       };
     }
     console.log('Threshold changed — re-evaluating scan');
   }
 
-  // Read severity threshold from config table
+  // Read severity threshold
   console.log('Reading severity threshold from config table');
   const config = await dynamo.send(new GetCommand({
     TableName: process.env.CONFIG_TABLE,
@@ -67,19 +65,51 @@ export const handler = async (event) => {
   const threshold = config.Item ? parseInt(config.Item.value) : 3;
   console.log(`Severity threshold: ${threshold}`);
 
+  // Download repo zip from GitHub and upload to S3
+  // Lambda has internet access — Fargate private subnet does not
+  let sourceS3Key = null;
+  try {
+    console.log(`Downloading repo zip for ${repoValue}@${commitSha}`);
+    const token = githubToken || process.env.GITHUB_TOKEN;
+    const headers = { "User-Agent": "SecureGate-Scanner" };
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+
+    const zipUrl = `https://api.github.com/repos/${repoValue}/zipball/${commitSha}`;
+    const response = await fetch(zipUrl, { headers, redirect: "follow" });
+
+    if (!response.ok) {
+      throw new Error(`GitHub API returned ${response.status}: ${response.statusText}`);
+    }
+
+    const zipBuffer = Buffer.from(await response.arrayBuffer());
+    sourceS3Key = `source-zips/${commitSha}.zip`;
+
+    await s3.send(new PutObjectCommand({
+      Bucket:      process.env.S3_BUCKET,
+      Key:         sourceS3Key,
+      Body:        zipBuffer,
+      ContentType: "application/zip"
+    }));
+
+    console.log(`Repo zip uploaded to s3://${process.env.S3_BUCKET}/${sourceS3Key}`);
+  } catch (err) {
+    console.error(`Failed to download/upload repo zip (non-fatal):`, err.message);
+  }
+
   // Write pending record to DynamoDB
   console.log('Writing pending scan record to DynamoDB');
   await dynamo.send(new PutCommand({
     TableName: process.env.DYNAMODB_TABLE,
     Item: {
-      scanId: commitSha,
-      imageUri: imageUri || 'unknown',
-      prNumber: String(prNumber || '0'),
-      repo: repoValue,
-      status: 'pending',
+      scanId:      commitSha,
+      imageUri:    imageUri || 'unknown',
+      prNumber:    String(prNumber || '0'),
+      repo:        repoValue,
+      status:      'pending',
       threshold,
-      timestamp: new Date().toISOString(),
-      expiresAt: Math.floor(Date.now() / 1000) + (30 * 24 * 60 * 60)
+      sourceS3Key: sourceS3Key || '',
+      timestamp:   new Date().toISOString(),
+      expiresAt:   Math.floor(Date.now() / 1000) + (30 * 24 * 60 * 60)
     }
   }));
 
@@ -88,14 +118,15 @@ export const handler = async (event) => {
   await sqs.send(new SendMessageCommand({
     QueueUrl: process.env.SAST_QUEUE_URL,
     MessageBody: JSON.stringify({
-      scanId: commitSha,
+      scanId:      commitSha,
       imageUri,
-      prNumber: String(prNumber || '0'),
-      repo: repoValue
+      prNumber:    String(prNumber || '0'),
+      repo:        repoValue,
+      sourceS3Key: sourceS3Key || ''
     })
   }));
 
-  // Launch SAST Fargate task to process the job
+  // Launch SAST Fargate task
   console.log('Launching SAST Fargate task');
   try {
     await ecs.send(new RunTaskCommand({
@@ -112,17 +143,12 @@ export const handler = async (event) => {
     }));
     console.log('SAST Fargate task launched successfully');
   } catch (err) {
-    // Non-fatal — SQS message stays in queue, worker will retry
     console.error('Failed to launch Fargate task:', err.message);
   }
 
   console.log(`Scan queued successfully for commit ${commitSha}`);
   return {
     statusCode: 200,
-    body: JSON.stringify({
-      scanId: commitSha,
-      status: 'queued',
-      message: 'Scan queued successfully'
-    })
+    body: JSON.stringify({ scanId: commitSha, status: 'queued', message: 'Scan queued successfully' })
   };
 };

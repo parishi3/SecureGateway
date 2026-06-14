@@ -49,6 +49,7 @@ resource "aws_lambda_function" "trigger" {
       PRIVATE_SUBNET    = aws_subnet.private.id
       FARGATE_SG        = aws_security_group.fargate.id
       AWS_ACCOUNT_ID    = data.aws_caller_identity.current.account_id
+      S3_BUCKET         = aws_s3_bucket.reports.bucket
     }
   }
 

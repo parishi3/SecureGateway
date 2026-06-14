@@ -1,7 +1,7 @@
 import { SQSClient, ReceiveMessageCommand, DeleteMessageCommand } from "@aws-sdk/client-sqs";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, UpdateCommand } from "@aws-sdk/lib-dynamodb";
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import { scanDirectory } from "./scanner.js";
 import { execSync } from "child_process";
 import { createWriteStream } from "fs";
@@ -16,8 +16,6 @@ const QUEUE_URL    = process.env.QUEUE_URL;
 const DYNAMO_TABLE = process.env.DYNAMODB_TABLE;
 const S3_BUCKET    = process.env.S3_BUCKET;
 const MAX_WAIT     = parseInt(process.env.MAX_WAIT_SECONDS || "600");
-
-// ── POLL SQS ─────────────────────────────────────────────────────
 
 async function pollQueue() {
   const result = await sqs.send(new ReceiveMessageCommand({
@@ -36,11 +34,8 @@ async function deleteMessage(receiptHandle) {
   }));
 }
 
-// ── DOWNLOAD REPO VIA GITHUB API ──────────────────────────────────
-// Private subnet has no internet route — use GitHub API zip download
-// which goes through HTTPS and works without a NAT Gateway
-
-async function cloneRepo(repo, commitSha, scanId) {
+// Download source zip from S3 — Lambda uploaded it there, S3 has VPC endpoint
+async function getSourceFromS3(sourceS3Key, scanId) {
   const workDir   = `/tmp/scan-${scanId}`;
   const zipPath   = `${workDir}/repo.zip`;
   const sourceDir = `${workDir}/source`;
@@ -48,47 +43,35 @@ async function cloneRepo(repo, commitSha, scanId) {
   fs.mkdirSync(workDir,   { recursive: true });
   fs.mkdirSync(sourceDir, { recursive: true });
 
-  const zipUrl = `https://api.github.com/repos/${repo}/zipball/${commitSha}`;
-  console.log(`Downloading repo zip: ${zipUrl}`);
+  console.log(`Downloading source zip from S3: ${sourceS3Key}`);
 
-  const response = await fetch(zipUrl, {
-    headers: { "User-Agent": "SecureGate-Scanner" },
-    redirect: "follow"
-  });
+  const response = await s3.send(new GetObjectCommand({
+    Bucket: S3_BUCKET,
+    Key:    sourceS3Key
+  }));
 
-  if (!response.ok) {
-    throw new Error(`GitHub API returned ${response.status}: ${response.statusText}`);
-  }
-
-  // Save zip to disk
   const writer = createWriteStream(zipPath);
-  await pipeline(response.body, writer);
-  console.log(`Downloaded repo zip to ${zipPath}`);
+  await pipeline(response.Body, writer);
+  console.log(`Downloaded source zip to ${zipPath}`);
 
-  // Extract zip
   execSync(`unzip -q ${zipPath} -d ${workDir}/extracted`, { timeout: 60000 });
 
-  // GitHub zip contains a single top-level directory — move its contents to sourceDir
   const extracted = fs.readdirSync(`${workDir}/extracted`)[0];
   execSync(`cp -r ${workDir}/extracted/${extracted}/. ${sourceDir}/`);
 
-  console.log(`Extracted repo to ${sourceDir}`);
+  console.log(`Extracted source to ${sourceDir}`);
   return sourceDir;
 }
-
-// ── UPDATE DYNAMODB ───────────────────────────────────────────────
 
 async function updateDynamo(scanId, fields) {
   const setExpressions = [];
   const names  = {};
   const values = {};
-
   for (const [key, val] of Object.entries(fields)) {
     setExpressions.push(`#${key} = :${key}`);
     names[`#${key}`]  = key;
     values[`:${key}`] = val;
   }
-
   await dynamo.send(new UpdateCommand({
     TableName:                 DYNAMO_TABLE,
     Key:                       { scanId },
@@ -97,8 +80,6 @@ async function updateDynamo(scanId, fields) {
     ExpressionAttributeValues: values
   }));
 }
-
-// ── GENERATE HTML REPORT ─────────────────────────────────────────
 
 function generateHtmlReport(scanId, vulnerabilities, summary) {
   const rows = vulnerabilities.map(v => `
@@ -117,13 +98,13 @@ function generateHtmlReport(scanId, vulnerabilities, summary) {
   <title>SecureGate SAST Report — ${scanId}</title>
   <style>
     body { font-family: sans-serif; padding: 2rem; }
-    h1   { color: #333; }
+    h1 { color: #333; }
     table { border-collapse: collapse; width: 100%; }
     th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
     th { background: #f4f4f4; }
-    tr.high   td:first-child { color: #c00; font-weight: bold; }
+    tr.high td:first-child { color: #c00; font-weight: bold; }
     tr.medium td:first-child { color: #e65c00; font-weight: bold; }
-    tr.low    td:first-child { color: #666; }
+    tr.low td:first-child { color: #666; }
     .summary { margin-bottom: 1.5rem; }
     code { background: #f0f0f0; padding: 2px 4px; border-radius: 3px; font-size: 0.85em; }
   </style>
@@ -147,8 +128,6 @@ function generateHtmlReport(scanId, vulnerabilities, summary) {
 </html>`;
 }
 
-// ── UPLOAD REPORT TO S3 ───────────────────────────────────────────
-
 async function uploadReport(scanId, html) {
   await s3.send(new PutObjectCommand({
     Bucket:      S3_BUCKET,
@@ -159,48 +138,33 @@ async function uploadReport(scanId, html) {
   console.log(`Report uploaded to s3://${S3_BUCKET}/reports/${scanId}.html`);
 }
 
-// ── PROCESS ONE SCAN JOB ─────────────────────────────────────────
-
 async function processScan(message) {
-  const { scanId, imageUri, repo } = JSON.parse(message.Body);
-
-  // Extract commitSha from imageUri tag (format: .../client-scans:<commitSha>)
-  const commitSha = imageUri?.split(":").pop() || scanId;
-
+  const { scanId, imageUri, repo, sourceS3Key } = JSON.parse(message.Body);
   console.log(`Processing SAST scan for scanId: ${scanId}, repo: ${repo}`);
 
-  // Skip invalid messages from old test runs
   if (!repo || repo === "undefined") {
     console.log(`Skipping scan ${scanId} — no valid repo`);
-    await updateDynamo(scanId, {
-      status:      "sast_complete",
-      highCount:   0,
-      mediumCount: 0,
-      lowCount:    0,
-      sastError:   "No repo provided"
-    });
+    await updateDynamo(scanId, { status: "sast_complete", highCount: 0, mediumCount: 0, lowCount: 0, sastError: "No repo provided" });
     return;
   }
 
-  // Mark as running
+  if (!sourceS3Key) {
+    console.log(`Skipping scan ${scanId} — no sourceS3Key`);
+    await updateDynamo(scanId, { status: "sast_complete", highCount: 0, mediumCount: 0, lowCount: 0, sastError: "No source zip available" });
+    return;
+  }
+
   await updateDynamo(scanId, { status: "sast_running" });
 
   let sourceDir;
   try {
-    sourceDir = await cloneRepo(repo, commitSha, scanId);
+    sourceDir = await getSourceFromS3(sourceS3Key, scanId);
   } catch (err) {
-    console.error(`Failed to download repo:`, err);
-    await updateDynamo(scanId, {
-      status:      "sast_complete",
-      highCount:   0,
-      mediumCount: 0,
-      lowCount:    0,
-      sastError:   err.message
-    });
+    console.error(`Failed to get source from S3:`, err);
+    await updateDynamo(scanId, { status: "sast_complete", highCount: 0, mediumCount: 0, lowCount: 0, sastError: err.message });
     return;
   }
 
-  // Run the scanner
   console.log(`Scanning source directory: ${sourceDir}`);
   let vulnerabilities = [];
   try {
@@ -217,7 +181,6 @@ async function processScan(message) {
 
   console.log(`Scan complete — HIGH: ${summary.high}, MEDIUM: ${summary.medium}, LOW: ${summary.low}`);
 
-  // Upload HTML report
   try {
     const html = generateHtmlReport(scanId, vulnerabilities, summary);
     await uploadReport(scanId, html);
@@ -225,7 +188,6 @@ async function processScan(message) {
     console.error(`Failed to upload report:`, err);
   }
 
-  // Write results to DynamoDB — status = "sast_complete" triggers Severity Check Lambda
   await updateDynamo(scanId, {
     status:      "sast_complete",
     highCount:   summary.high,
@@ -235,14 +197,11 @@ async function processScan(message) {
 
   console.log(`DynamoDB updated — status: sast_complete`);
 
-  // Cleanup
   try {
     fs.rmSync(`/tmp/scan-${scanId}`, { recursive: true, force: true });
     console.log(`Cleaned up /tmp/scan-${scanId}`);
   } catch (_) {}
 }
-
-// ── MAIN LOOP ────────────────────────────────────────────────────
 
 async function main() {
   console.log("SAST worker started — polling SQS...");
