@@ -4,6 +4,8 @@ import { DynamoDBDocumentClient, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { scanDirectory } from "./scanner.js";
 import { execSync } from "child_process";
+import { createWriteStream } from "fs";
+import { pipeline } from "stream/promises";
 import fs from "fs";
 
 const sqs    = new SQSClient({ region: process.env.AWS_REGION || "us-east-1" });
@@ -34,31 +36,43 @@ async function deleteMessage(receiptHandle) {
   }));
 }
 
-// ── CLONE REPO AND GET SOURCE ─────────────────────────────────────
-// Fargate containers don't have Docker — clone the repo directly instead
+// ── DOWNLOAD REPO VIA GITHUB API ──────────────────────────────────
+// Private subnet has no internet route — use GitHub API zip download
+// which goes through HTTPS and works without a NAT Gateway
 
 async function cloneRepo(repo, commitSha, scanId) {
-  const workDir = `/tmp/scan-${scanId}`;
+  const workDir   = `/tmp/scan-${scanId}`;
+  const zipPath   = `${workDir}/repo.zip`;
   const sourceDir = `${workDir}/source`;
-  fs.mkdirSync(workDir, { recursive: true });
 
-  console.log(`Cloning repo: https://github.com/${repo}.git at commit ${commitSha}`);
-  execSync(
-    `git clone --depth 1 https://github.com/${repo}.git ${sourceDir}`,
-    { stdio: "inherit", timeout: 300000 }
-  );
+  fs.mkdirSync(workDir,   { recursive: true });
+  fs.mkdirSync(sourceDir, { recursive: true });
 
-  // Checkout the specific commit if needed
-  try {
-    execSync(`cd ${sourceDir} && git fetch --depth 1 origin ${commitSha} && git checkout ${commitSha}`, {
-      stdio: "inherit",
-      timeout: 60000
-    });
-  } catch (_) {
-    // If specific commit checkout fails, use whatever was cloned (latest)
-    console.log(`Could not checkout specific commit — scanning latest`);
+  const zipUrl = `https://api.github.com/repos/${repo}/zipball/${commitSha}`;
+  console.log(`Downloading repo zip: ${zipUrl}`);
+
+  const response = await fetch(zipUrl, {
+    headers: { "User-Agent": "SecureGate-Scanner" },
+    redirect: "follow"
+  });
+
+  if (!response.ok) {
+    throw new Error(`GitHub API returned ${response.status}: ${response.statusText}`);
   }
 
+  // Save zip to disk
+  const writer = createWriteStream(zipPath);
+  await pipeline(response.body, writer);
+  console.log(`Downloaded repo zip to ${zipPath}`);
+
+  // Extract zip
+  execSync(`unzip -q ${zipPath} -d ${workDir}/extracted`, { timeout: 60000 });
+
+  // GitHub zip contains a single top-level directory — move its contents to sourceDir
+  const extracted = fs.readdirSync(`${workDir}/extracted`)[0];
+  execSync(`cp -r ${workDir}/extracted/${extracted}/. ${sourceDir}/`);
+
+  console.log(`Extracted repo to ${sourceDir}`);
   return sourceDir;
 }
 
@@ -175,7 +189,7 @@ async function processScan(message) {
   try {
     sourceDir = await cloneRepo(repo, commitSha, scanId);
   } catch (err) {
-    console.error(`Failed to clone repo:`, err);
+    console.error(`Failed to download repo:`, err);
     await updateDynamo(scanId, {
       status:      "sast_complete",
       highCount:   0,
