@@ -3,21 +3,17 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { scanDirectory } from "./scanner.js";
-import { execSync, exec } from "child_process";
-import { promisify } from "util";
+import { execSync } from "child_process";
 import fs from "fs";
-import path from "path";
 
-const execAsync = promisify(exec);
-
-const sqs = new SQSClient({ region: process.env.AWS_REGION || "us-east-1" });
+const sqs    = new SQSClient({ region: process.env.AWS_REGION || "us-east-1" });
 const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({ region: process.env.AWS_REGION || "us-east-1" }));
-const s3 = new S3Client({ region: process.env.AWS_REGION || "us-east-1" });
+const s3     = new S3Client({ region: process.env.AWS_REGION || "us-east-1" });
 
-const QUEUE_URL     = process.env.QUEUE_URL;
-const DYNAMO_TABLE  = process.env.DYNAMODB_TABLE;
-const S3_BUCKET     = process.env.S3_BUCKET;
-const MAX_WAIT      = parseInt(process.env.MAX_WAIT_SECONDS || "600");
+const QUEUE_URL    = process.env.QUEUE_URL;
+const DYNAMO_TABLE = process.env.DYNAMODB_TABLE;
+const S3_BUCKET    = process.env.S3_BUCKET;
+const MAX_WAIT     = parseInt(process.env.MAX_WAIT_SECONDS || "600");
 
 // ── POLL SQS ─────────────────────────────────────────────────────
 
@@ -25,7 +21,7 @@ async function pollQueue() {
   const result = await sqs.send(new ReceiveMessageCommand({
     QueueUrl:            QUEUE_URL,
     MaxNumberOfMessages: 1,
-    WaitTimeSeconds:     20,   // long polling
+    WaitTimeSeconds:     20,
     VisibilityTimeout:   600
   }));
   return result.Messages?.[0] || null;
@@ -38,26 +34,32 @@ async function deleteMessage(receiptHandle) {
   }));
 }
 
-// ── PULL IMAGE AND EXTRACT SOURCE ────────────────────────────────
+// ── CLONE REPO AND GET SOURCE ─────────────────────────────────────
+// Fargate containers don't have Docker — clone the repo directly instead
 
-async function extractSourceFromImage(imageUri, scanId) {
+async function cloneRepo(repo, commitSha, scanId) {
   const workDir = `/tmp/scan-${scanId}`;
+  const sourceDir = `${workDir}/source`;
   fs.mkdirSync(workDir, { recursive: true });
 
-  console.log(`Pulling image: ${imageUri}`);
-  execSync(`docker pull ${imageUri}`, { stdio: "inherit" });
-
-  console.log(`Creating container to extract source...`);
-  const { stdout: containerId } = await execAsync(
-    `docker create ${imageUri}`
+  console.log(`Cloning repo: https://github.com/${repo}.git at commit ${commitSha}`);
+  execSync(
+    `git clone --depth 1 https://github.com/${repo}.git ${sourceDir}`,
+    { stdio: "inherit", timeout: 120000 }
   );
-  const cid = containerId.trim();
 
-  console.log(`Copying source files from container...`);
-  execSync(`docker cp ${cid}:/app ${workDir}/source`, { stdio: "inherit" });
-  execSync(`docker rm ${cid}`, { stdio: "inherit" });
+  // Checkout the specific commit if needed
+  try {
+    execSync(`cd ${sourceDir} && git fetch --depth 1 origin ${commitSha} && git checkout ${commitSha}`, {
+      stdio: "inherit",
+      timeout: 60000
+    });
+  } catch (_) {
+    // If specific commit checkout fails, use whatever was cloned (latest)
+    console.log(`Could not checkout specific commit — scanning latest`);
+  }
 
-  return `${workDir}/source`;
+  return sourceDir;
 }
 
 // ── UPDATE DYNAMODB ───────────────────────────────────────────────
@@ -146,23 +148,40 @@ async function uploadReport(scanId, html) {
 // ── PROCESS ONE SCAN JOB ─────────────────────────────────────────
 
 async function processScan(message) {
-  const { scanId, imageUri } = JSON.parse(message.Body);
-  console.log(`Processing SAST scan for scanId: ${scanId}, image: ${imageUri}`);
+  const { scanId, imageUri, repo } = JSON.parse(message.Body);
+
+  // Extract commitSha from imageUri tag (format: .../client-scans:<commitSha>)
+  const commitSha = imageUri?.split(":").pop() || scanId;
+
+  console.log(`Processing SAST scan for scanId: ${scanId}, repo: ${repo}`);
+
+  // Skip invalid messages from old test runs
+  if (!repo || repo === "undefined") {
+    console.log(`Skipping scan ${scanId} — no valid repo`);
+    await updateDynamo(scanId, {
+      status:      "sast_complete",
+      highCount:   0,
+      mediumCount: 0,
+      lowCount:    0,
+      sastError:   "No repo provided"
+    });
+    return;
+  }
 
   // Mark as running
   await updateDynamo(scanId, { status: "sast_running" });
 
   let sourceDir;
   try {
-    sourceDir = await extractSourceFromImage(imageUri, scanId);
+    sourceDir = await cloneRepo(repo, commitSha, scanId);
   } catch (err) {
-    console.error(`Failed to extract source from image:`, err);
+    console.error(`Failed to clone repo:`, err);
     await updateDynamo(scanId, {
-      status:       "sast_complete",
-      highCount:    0,
-      mediumCount:  0,
-      lowCount:     0,
-      sastError:    err.message
+      status:      "sast_complete",
+      highCount:   0,
+      mediumCount: 0,
+      lowCount:    0,
+      sastError:   err.message
     });
     return;
   }
@@ -220,7 +239,6 @@ async function main() {
   const startTime = Date.now();
 
   while (true) {
-    // Exit if max wait exceeded (Fargate will restart the task)
     if ((Date.now() - startTime) / 1000 > MAX_WAIT) {
       console.log(`Max wait time (${MAX_WAIT}s) reached — exiting`);
       process.exit(0);
@@ -246,8 +264,6 @@ async function main() {
       console.log("Message deleted from queue");
     } catch (err) {
       console.error("Failed to process scan — message will return to queue for retry:", err);
-      // Do NOT delete — SQS will make it visible again after visibility timeout
-      // After maxReceiveCount retries it goes to DLQ
     }
   }
 }
