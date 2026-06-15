@@ -168,11 +168,17 @@ async function processScan(message) {
   console.log(`Scanning source directory: ${sourceDir}`);
   let vulnerabilities = [];
   try {
-    vulnerabilities = await scanDirectory(sourceDir);
+    const result = await scanDirectory(sourceDir);
+    if (Array.isArray(result)) {
+      vulnerabilities = result;
+    } else if (result && Array.isArray(result.vulnerabilities)) {
+      vulnerabilities = result.vulnerabilities;
+    } else {
+      console.log(`Scanner returned unexpected format:`, JSON.stringify(result));
+    }
   } catch (err) {
     console.error(`Scanner error:`, err);
   }
-
   const summary = {
     high:   vulnerabilities.filter(v => v.severity === "HIGH").length,
     medium: vulnerabilities.filter(v => v.severity === "MEDIUM").length,
