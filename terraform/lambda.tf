@@ -90,6 +90,10 @@ resource "aws_lambda_function" "severity_check" {
       DYNAMODB_TABLE    = aws_dynamodb_table.scans.name
       CONFIG_TABLE      = aws_dynamodb_table.config.name
       SNS_TOPIC_ARN     = aws_sns_topic.alerts.arn
+      ECS_CLUSTER       = aws_ecs_cluster.main.name
+      PENTEST_TASK_DEF  = aws_ecs_task_definition.pentest_worker.arn
+      PRIVATE_SUBNET    = aws_subnet.private.id
+      FARGATE_SG        = aws_security_group.fargate.id
     }
   }
 
