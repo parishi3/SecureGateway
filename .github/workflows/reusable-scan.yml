@@ -104,8 +104,8 @@ jobs:
 
       - name: Poll for results
         run: |
-          echo "Polling for scan results (max 10 minutes)..."
-          for i in $(seq 1 60); do
+          echo "Polling for scan results (max 15 minutes)..."
+          for i in $(seq 1 90); do
             STATUS=$(aws dynamodb get-item \
               --table-name securegateway-scans \
               --key "{\"scanId\":{\"S\":\"$SCAN_ID\"}}" \
@@ -119,8 +119,8 @@ jobs:
               break
             fi
 
-            if [ "$i" -eq 60 ]; then
-              echo "Timeout — scan took longer than 10 minutes"
+            if [ "$i" -eq 90 ]; then
+              echo "Timeout — scan took longer than 15 minutes"
               exit 1
             fi
 
